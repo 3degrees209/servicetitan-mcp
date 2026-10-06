@@ -8,6 +8,7 @@ import {
   jobTypeNames,
   resolveId,
   stGet,
+  stGetAll,
   stWrite,
   tagTypeNames,
   technicianNames,
@@ -82,6 +83,53 @@ async function getTaskData() {
   return data;
 }
 const toMap = (rows: any[], id = "id") => new Map<number, string>((rows ?? []).filter((r) => r.active !== false).map((r) => [r[id], r.name]));
+
+
+// Pricebook lookup by id, code, or name across services / materials / equipment.
+// The pricebook endpoints ignore search filters, so load once and match here.
+let pricebook: { at: number; items: any[] } | null = null;
+async function getPricebook() {
+  if (pricebook && Date.now() - pricebook.at < 1_800_000) return pricebook.items;
+  const kinds = ["services", "materials", "equipment"] as const;
+  const lists = await Promise.all(
+    kinds.map((k) => stGetAll(`pricebook/v2/tenant/{tenant}/${k}`, { active: "True" }, 20000).then((r) => r.data.map((x: any) => ({ ...x, kind: k }))))
+  );
+  pricebook = { at: Date.now(), items: lists.flat() };
+  return pricebook.items;
+}
+
+async function resolveSku(value: string): Promise<any> {
+  const items = await getPricebook();
+  const v = value.trim().toLowerCase();
+  if (/^\d+$/.test(v)) {
+    const byId = items.find((x) => String(x.id) === v);
+    if (byId) return byId;
+  }
+  const byCode = items.filter((x) => String(x.code ?? "").toLowerCase() === v);
+  if (byCode.length === 1) return byCode[0];
+  const byName = items.filter((x) =>
+    [x.code, x.displayName, x.description].some((f) => String(f ?? "").toLowerCase().includes(v))
+  );
+  if (byName.length === 1) return byName[0];
+  if (!byName.length) throw new Error(`No pricebook item matches "${value}".`);
+  throw new Error(`"${value}" matches several pricebook items: ${byName.slice(0, 12).map((x) => `${x.code} (${x.displayName ?? ""})`).join(", ")}. Use the exact code.`);
+}
+
+const skuLabel = (x: any) => `${x.code}${x.displayName ? ` — ${x.displayName}` : ""}`;
+const plainText = (h: unknown) => String(h ?? "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+async function getInvoice(id: number) {
+  const res = await stGet("accounting/v2/tenant/{tenant}/invoices", { ids: id });
+  const inv = res.data?.[0];
+  if (!inv) throw new Error(`Invoice ${id} not found.`);
+  return inv;
+}
+
+const invoiceSummary = (inv: any) => ({
+  invoice: inv.referenceNumber, customer: inv.customer?.name, job: inv.job?.number ?? null,
+  date: String(inv.invoiceDate ?? "").slice(0, 10), total: Number(inv.total), balance: Number(inv.balance),
+  exported: !!inv.exportId || inv.syncStatus === "Exported",
+});
 
 const TARGET_PATHS = {
   customer: (id: number) => `crm/v2/tenant/{tenant}/customers/${id}`,
@@ -565,6 +613,251 @@ export function registerWriteTools(server: any) {
             after: next.map((t) => tags.get(t) ?? t),
           },
           run: () => stWrite("PATCH", path, { tagTypeIds: next }),
+        };
+      })
+  );
+  server.tool(
+    "record_payment",
+    "Record a payment received (cash, check, card taken elsewhere, ACH, financing) and apply it to one or more invoices. This only records money already collected — it does not charge a card. See list_reference kind=payment_types. Two-step: preview first, then confirm.",
+    {
+      payment_type: z.string().describe("Payment type name (partial ok) or id, e.g. 'Check', 'Cash'"),
+      applied_to: z
+        .array(z.object({ invoice_id: z.number(), amount: z.number().positive() }))
+        .min(1)
+        .describe("Invoices and the amount applied to each"),
+      paid_on: z.string().optional().describe("Date received (default today)"),
+      memo: z.string().optional(),
+      check_number: z.string().optional(),
+      auth_code: z.string().optional().describe("Card authorization code, if any"),
+      confirm: CONFIRM,
+    },
+    CHANGE,
+    async (a: any) =>
+      twoStep(a.confirm, async () => {
+        const { data: types } = await stGetAll("accounting/v2/tenant/{tenant}/payment-types", {}, 500);
+        const typeId = await resolveId(new Map(types.map((t: any) => [t.id, t.name])), a.payment_type, "payment type");
+        const invoices = await Promise.all(a.applied_to.map((x: any) => getInvoice(x.invoice_id)));
+        const warnings: string[] = [];
+        a.applied_to.forEach((x: any, i: number) => {
+          const bal = Number(invoices[i].balance);
+          if (x.amount > bal + 0.005) warnings.push(`Invoice ${invoices[i].referenceNumber}: $${x.amount} is more than its $${bal} balance (would create a credit).`);
+        });
+        const total = a.applied_to.reduce((s: number, x: any) => s + x.amount, 0);
+        const body: Record<string, unknown> = {
+          typeId,
+          paidOn: dateParam(a.paid_on ?? new Date().toISOString().slice(0, 10)),
+          memo: a.memo ?? "",
+          splits: a.applied_to.map((x: any) => ({ invoiceId: x.invoice_id, amount: x.amount })),
+          ...(a.check_number ? { checkNumber: a.check_number } : {}),
+          ...(a.auth_code ? { authCode: a.auth_code } : {}),
+        };
+        return {
+          action: `Record $${total.toFixed(2)} ${types.find((t: any) => t.id === typeId)?.name} payment`,
+          details: {
+            applied_to: a.applied_to.map((x: any, i: number) => ({ ...invoiceSummary(invoices[i]), applying: x.amount })),
+            warnings,
+            request: body,
+          },
+          run: () => stWrite("POST", "accounting/v2/tenant/{tenant}/payments", body),
+        };
+      })
+  );
+
+  server.tool(
+    "edit_invoice",
+    "Edit an invoice: summary, invoice date, due date, and line items (add by pricebook code, change quantity/price/description, or remove). Two-step: preview first, then confirm.",
+    {
+      invoice_id: z.number(),
+      summary: z.string().optional(),
+      invoice_date: z.string().optional(),
+      due_date: z.string().optional(),
+      add_items: z
+        .array(z.object({
+          sku: z.string().describe("Pricebook code, name, or id"),
+          quantity: z.number().optional(),
+          unit_price: z.number().optional().describe("Leave out to use the pricebook price"),
+          description: z.string().optional(),
+        }))
+        .optional(),
+      change_items: z
+        .array(z.object({
+          item_id: z.number().describe("Line item id from the preview / invoice"),
+          quantity: z.number().optional(),
+          unit_price: z.number().optional(),
+          description: z.string().optional(),
+        }))
+        .optional(),
+      remove_item_ids: z.array(z.number()).optional(),
+      confirm: CONFIRM,
+    },
+    CHANGE,
+    async (a: any) =>
+      twoStep(a.confirm, async () => {
+        const inv = await getInvoice(a.invoice_id);
+        const items: any[] = inv.items ?? [];
+        const byId = new Map(items.map((x) => [x.id, x]));
+        for (const id of [...(a.remove_item_ids ?? []), ...(a.change_items ?? []).map((c: any) => c.item_id)]) {
+          if (!byId.has(id)) throw new Error(`Item ${id} isn't on invoice ${inv.referenceNumber}. Current items: ${items.map((x) => `${x.id} ${x.skuName}`).join(", ")}`);
+        }
+        const fields: Record<string, unknown> = {};
+        if (a.summary !== undefined) fields.summary = a.summary;
+        if (a.invoice_date) fields.invoicedOn = dateParam(a.invoice_date);
+        if (a.due_date) fields.dueDate = dateParam(a.due_date);
+        const adds = await Promise.all((a.add_items ?? []).map(async (x: any) => {
+          const sku = await resolveSku(x.sku);
+          return {
+            label: skuLabel(sku),
+            body: {
+              skuId: sku.id,
+              description: x.description || plainText(sku.description) || sku.displayName || sku.code,
+              quantity: x.quantity ?? 1,
+              isAddOn: false,
+              ...(x.unit_price !== undefined ? { unitPrice: x.unit_price } : {}),
+            },
+          };
+        }));
+        const changes = (a.change_items ?? []).map((c: any) => {
+          const cur = byId.get(c.item_id);
+          return {
+            label: cur.skuName,
+            before: { quantity: Number(cur.quantity), unit_price: Number(cur.price), description: plainText(cur.description) },
+            body: {
+              id: cur.id, skuId: cur.skuId,
+              description: c.description ?? cur.description,
+              quantity: c.quantity ?? Number(cur.quantity),
+              unitPrice: c.unit_price ?? Number(cur.price),
+              isAddOn: !!cur.isAddOn,
+            },
+          };
+        });
+        const removes = (a.remove_item_ids ?? []).map((id: number) => byId.get(id));
+        if (!Object.keys(fields).length && !adds.length && !changes.length && !removes.length) {
+          throw new Error("Nothing to change.");
+        }
+        const s = invoiceSummary(inv);
+        return {
+          action: `Edit invoice ${inv.referenceNumber}`,
+          details: {
+            invoice: s,
+            warnings: [
+              ...(s.exported ? ["This invoice was already exported to accounting — the change may need to be re-synced."] : []),
+              ...(Number(inv.total) - Number(inv.balance) > 0.005 ? ["This invoice has payments applied; changing the total changes the balance due."] : []),
+            ],
+            current_items: items.map((x) => ({ item_id: x.id, item: x.skuName, quantity: Number(x.quantity), unit_price: Number(x.price), total: Number(x.total) })),
+            field_changes: Object.keys(fields).length ? { before: { summary: inv.summary, invoice_date: inv.invoiceDate, due_date: inv.dueDate }, after: fields } : null,
+            add: adds.map((x: any) => ({ item: x.label, quantity: x.body.quantity, unit_price: x.body.unitPrice ?? "pricebook price" })),
+            change: changes.map((c: any) => ({ item: c.label, before: c.before, after: { quantity: c.body.quantity, unit_price: c.body.unitPrice } })),
+            remove: removes.map((x: any) => ({ item_id: x.id, item: x.skuName, total: Number(x.total) })),
+          },
+          run: async () => {
+            const path = `accounting/v2/tenant/{tenant}/invoices/${a.invoice_id}`;
+            if (Object.keys(fields).length) await stWrite("PATCH", path, fields);
+            for (const x of removes) await stWrite("DELETE", `${path}/items/${x.id}`);
+            for (const c of changes) await stWrite("PATCH", `${path}/items`, c.body);
+            for (const x of adds) await stWrite("PATCH", `${path}/items`, x.body);
+            const after = await getInvoice(a.invoice_id);
+            return { invoice: after.referenceNumber, total: Number(after.total), balance: Number(after.balance) };
+          },
+        };
+      })
+  );
+
+  server.tool(
+    "write_off_balance",
+    "Write off an invoice's unpaid balance by creating an adjustment invoice with a negative write-off line (the usual ServiceTitan A/R cleanup). Uses the WRITEOFF_SKU pricebook item unless sku is given. Two-step: preview first, then confirm.",
+    {
+      invoice_id: z.number(),
+      amount: z.number().positive().optional().describe("Amount to write off (default: the full balance)"),
+      reason: z.string().describe("Why it's being written off — goes on the adjustment invoice"),
+      sku: z.string().optional().describe("Write-off pricebook code/name/id; defaults to WRITEOFF_SKU env"),
+      confirm: CONFIRM,
+    },
+    CHANGE,
+    async (a: any) =>
+      twoStep(a.confirm, async () => {
+        const skuValue = a.sku ?? process.env.WRITEOFF_SKU;
+        if (!skuValue) throw new Error("Which pricebook item is the write-off? Pass sku (e.g. its code) or set WRITEOFF_SKU in Vercel.");
+        const [inv, sku] = await Promise.all([getInvoice(a.invoice_id), resolveSku(skuValue)]);
+        if (inv.adjustmentToId) throw new Error(`Invoice ${inv.referenceNumber} is itself an adjustment invoice — write off the original instead.`);
+        const balance = Number(inv.balance);
+        if (balance <= 0.005) throw new Error(`Invoice ${inv.referenceNumber} has no balance to write off.`);
+        const amount = Math.round((a.amount ?? balance) * 100) / 100;
+        if (amount > balance + 0.005) throw new Error(`$${amount} is more than the $${balance} balance.`);
+        const body = {
+          adjustmentToId: a.invoice_id,
+          summary: `Write-off: ${a.reason}`,
+          items: [{ skuId: sku.id, description: `Write-off: ${a.reason}`, quantity: 1, unitPrice: -amount, isAddOn: false }],
+        };
+        return {
+          action: `Write off $${amount.toFixed(2)} on invoice ${inv.referenceNumber}`,
+          details: {
+            invoice: invoiceSummary(inv),
+            write_off_item: skuLabel(sku),
+            balance_after: Math.round((balance - amount) * 100) / 100,
+            request: body,
+          },
+          run: async () => {
+            const adj = await stWrite("POST", "accounting/v2/tenant/{tenant}/invoices", body);
+            const after = await getInvoice(a.invoice_id);
+            return { adjustment_invoice_id: adj?.id ?? adj, original_balance_now: Number(after.balance) };
+          },
+        };
+      })
+  );
+
+  server.tool(
+    "sell_membership",
+    "Sell a membership to a customer at a location, which also creates the membership type's recurring services (e.g. annual filter changes). See list_reference kind=membership_types for types and billing options. Two-step: preview first, then confirm.",
+    {
+      customer_id: z.number(),
+      location_id: z.number(),
+      membership_type: z.string().describe("Membership type name (partial ok) or id"),
+      billing_option_id: z.number().optional().describe("Duration/billing option id; required if the type has more than one"),
+      business_unit: z.string().describe("Business unit name (partial ok) or id"),
+      sale_sku: z.string().describe("Pricebook item used to sell this membership (code, name, or id)"),
+      create_recurring_services: z.boolean().optional().describe("Default true — create the type's recurring services at the location"),
+      confirm: CONFIRM,
+    },
+    WRITE,
+    async (a: any) =>
+      twoStep(a.confirm, async () => {
+        const { data: types } = await stGetAll("memberships/v2/tenant/{tenant}/membership-types", { active: "True" }, 2000);
+        const typeId = await resolveId(new Map(types.map((t: any) => [t.id, t.name])), a.membership_type, "membership type");
+        const [billing, services, bu, cust, loc, sku] = await Promise.all([
+          stGet(`memberships/v2/tenant/{tenant}/membership-types/${typeId}/duration-billing-items`),
+          stGet(`memberships/v2/tenant/{tenant}/membership-types/${typeId}/recurring-service-items`),
+          businessUnitNames(),
+          stGet(TARGET_PATHS.customer(a.customer_id)),
+          stGet(TARGET_PATHS.location(a.location_id)),
+          resolveSku(a.sale_sku),
+        ]);
+        if (loc.customerId !== a.customer_id) throw new Error(`Location ${a.location_id} doesn't belong to customer ${a.customer_id}.`);
+        const options = (Array.isArray(billing) ? billing : billing.data ?? []).filter((b: any) => b.active !== false);
+        const option = a.billing_option_id ? options.find((b: any) => b.id === a.billing_option_id) : options.length === 1 ? options[0] : null;
+        if (!option) {
+          throw new Error(`Pick a billing option (billing_option_id): ${options.map((b: any) => `${b.id} = ${b.billingFrequency}${b.duration ? `, ${b.duration} months` : ""}, sale $${b.salePrice}, billing $${b.billingPrice}`).join("; ")}`);
+        }
+        const withServices = a.create_recurring_services !== false;
+        const body = {
+          customerId: a.customer_id,
+          locationId: a.location_id,
+          businessUnitId: await resolveId(bu, a.business_unit, "business unit"),
+          saleTaskId: sku.id,
+          durationBillingId: option.id,
+          recurringServiceAction: withServices ? "All" : "None",
+          ...(withServices ? { recurringLocationId: a.location_id } : {}),
+        };
+        const svc = Array.isArray(services) ? services : services.data ?? [];
+        return {
+          action: `Sell ${types.find((t: any) => t.id === typeId)?.name} membership to ${cust.name}`,
+          details: {
+            customer: cust.name, location: loc.address,
+            business_unit: bu.get(body.businessUnitId!), sale_item: skuLabel(sku),
+            billing: { frequency: option.billingFrequency, duration_months: option.duration, sale_price: option.salePrice, billing_price: option.billingPrice },
+            recurring_services: withServices ? (svc.length ? svc : "this membership type has no recurring services") : "not created",
+            request: body,
+          },
+          run: () => stWrite("POST", "memberships/v2/tenant/{tenant}/memberships/sale", body),
         };
       })
   );

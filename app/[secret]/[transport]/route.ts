@@ -335,7 +335,7 @@ const handler = createMcpHandler(
       {
         kind: z.enum([
           "technicians", "business_units", "job_types", "campaigns", "employees", "tag_types",
-          "cancel_reasons", "booking_providers", "task_options",
+          "cancel_reasons", "booking_providers", "task_options", "payment_types", "membership_types",
         ]),
       },
       { readOnlyHint: true },
@@ -348,6 +348,18 @@ const handler = createMcpHandler(
             business_units: slim(d.businessUnits, "value"), priorities: (d.taskPriorities ?? []).map((p: any) => p.name),
           });
         }
+        if (kind === "membership_types") {
+          const { data } = await stGetAll("memberships/v2/tenant/{tenant}/membership-types", { active: "True" }, 2000);
+          const withBilling = await Promise.all(data.map(async (t: any) => {
+            const b = await stGet(`memberships/v2/tenant/{tenant}/membership-types/${t.id}/duration-billing-items`).catch(() => []);
+            const opts = (Array.isArray(b) ? b : b.data ?? []).filter((x: any) => x.active !== false);
+            return {
+              id: t.id, name: t.name,
+              billing_options: opts.map((x: any) => ({ id: x.id, frequency: x.billingFrequency, duration_months: x.duration, sale_price: x.salePrice, billing_price: x.billingPrice })),
+            };
+          }));
+          return json({ count: withBilling.length, items: withBilling });
+        }
         const paths = {
           technicians: "settings/v2/tenant/{tenant}/technicians",
           business_units: "settings/v2/tenant/{tenant}/business-units",
@@ -357,6 +369,7 @@ const handler = createMcpHandler(
           tag_types: "settings/v2/tenant/{tenant}/tag-types",
           cancel_reasons: "jpm/v2/tenant/{tenant}/job-cancel-reasons",
           booking_providers: "crm/v2/tenant/{tenant}/booking-provider-tags",
+          payment_types: "accounting/v2/tenant/{tenant}/payment-types",
         };
         const { data } = await stGetAll(paths[kind], {}, 5000);
         return json({
@@ -436,7 +449,7 @@ const handler = createMcpHandler(
   {
     serverInfo: { name: "servicetitan", version: "1.0.0" },
     instructions:
-      "Access to this company's ServiceTitan data. Prefer the summary tools (list_jobs, invoices_summary, estimates_summary, calls_summary, payments_summary) for totals; use list_reference to learn technician/business-unit names; use saved reports (list_reports → describe_report → run_report) for anything matching a report the company already uses; use api_get only as a last resort. Write tools (create_*, update_*, add_*, set_contact, reschedule_appointment, cancel_job, assign_technicians) always return a preview first: show it to the user, and only call again with confirm: true after they explicitly approve. Never confirm on your own. Plain dates are in the business's local time zone and 'to' dates are exclusive.",
+      "Access to this company's ServiceTitan data. Prefer the summary tools (list_jobs, invoices_summary, estimates_summary, calls_summary, payments_summary) for totals; use list_reference to learn technician/business-unit names; use saved reports (list_reports → describe_report → run_report) for anything matching a report the company already uses; use api_get only as a last resort. Write tools (create_*, update_*, add_*, set_contact, reschedule_appointment, cancel_job, assign_technicians, record_payment, edit_invoice, write_off_balance, sell_membership) always return a preview first: show it to the user, and only call again with confirm: true after they explicitly approve. Never confirm on your own. Plain dates are in the business's local time zone and 'to' dates are exclusive.",
   },
   {
     // Requests are re-addressed to /connector/mcp below, so a secret with

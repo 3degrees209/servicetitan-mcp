@@ -2,7 +2,8 @@
 
 A small server that lets Claude answer questions about your ServiceTitan data
 (customers, jobs, appointments, invoices, payments, estimates, calls, and your saved reports) and,
-if you turn it on, make changes: bookings, customers, notes, jobs, appointments, tasks, and tags.
+if you turn it on, make changes: bookings, customers, notes, jobs, appointments, tasks, tags, payments, invoices,
+write-offs, and memberships (with their recurring services).
 
 Writes are **off** until you set `ALLOW_WRITES=true`. Even then, every change is two steps:
 Claude shows a preview of exactly what will change, and only does it after you say yes.
@@ -13,7 +14,7 @@ Claude shows a preview of exactly what will change, and only does it after you s
 In the ServiceTitan developer portal, your API app needs **read** scopes for: CRM, Job Planning (JPM),
 Dispatch, Accounting, Sales (Estimates), Settings, Marketing, Telecom, and Reporting.
 For the write tools it also needs **write** access to CRM, Job Planning, Dispatch, Accounting
-(only used to clear invoice items when canceling a job), Settings (tags), and Task Management.
+(payments, invoices, write-offs), Memberships, Settings (tags), and Task Management.
 Connect it under **Settings → Integrations → API Application Access**. You'll have 4 values:
 Client ID, Client Secret, App Key, and Tenant ID.
 
@@ -36,6 +37,7 @@ Vercel project → **Settings → Environment Variables**:
 | `BOOKING_PROVIDER_ID` | optional — default booking provider tag (name or id) for `create_booking` |
 | `TASK_SOURCE` | optional — default task source (name or id) for `create_task` |
 | `TASK_REPORTED_BY` | optional — default "reported by" employee (name or id) for `create_task` |
+| `WRITEOFF_SKU` | optional — pricebook code of your write-off item, used by `write_off_balance` |
 
 Then **Deployments → ⋯ → Redeploy** so the settings take effect.
 
@@ -80,6 +82,16 @@ Try: *"How much did we invoice last month by business unit?"*
 | `cancel_job` | Cancel with a reason (can clear auto-added invoice items first) |
 | `create_task` | Task Management task |
 | `update_tags` | Add/remove tags on a customer, location, or job |
+| `record_payment` | Record a payment already collected and apply it to invoices (does **not** charge a card) |
+| `edit_invoice` | Summary, dates, and line items (add by pricebook code, change, remove) |
+| `write_off_balance` | Write off a balance with an adjustment invoice |
+| `sell_membership` | Sell a membership, creating its recurring services at the location |
+
+Recurring services that aren't part of a membership can't be created through ServiceTitan's
+public API, so they're not available here.
+
+Payments, invoice edits, and write-offs can flow into your accounting export (e.g. QuickBooks)
+like any other ServiceTitan change. Try them on a test customer first.
 
 ## Troubleshooting
 - **"login failed"** — a client id/secret is wrong, or `SERVICETITAN_ENV` doesn't match the app.
