@@ -1,14 +1,19 @@
 # ServiceTitan connector for Claude
 
-A small read-only server that lets Claude answer questions about your ServiceTitan data
-(customers, jobs, appointments, invoices, payments, estimates, calls, and your saved reports).
-It cannot create, change, or delete anything in ServiceTitan.
+A small server that lets Claude answer questions about your ServiceTitan data
+(customers, jobs, appointments, invoices, payments, estimates, calls, and your saved reports) and,
+if you turn it on, make changes: bookings, customers, notes, jobs, appointments, tasks, and tags.
+
+Writes are **off** until you set `ALLOW_WRITES=true`. Even then, every change is two steps:
+Claude shows a preview of exactly what will change, and only does it after you say yes.
 
 ## Setup (about 10 minutes)
 
 ### 1. ServiceTitan API app
 In the ServiceTitan developer portal, your API app needs **read** scopes for: CRM, Job Planning (JPM),
 Dispatch, Accounting, Sales (Estimates), Settings, Marketing, Telecom, and Reporting.
+For the write tools it also needs **write** access to CRM, Job Planning, Dispatch, Accounting
+(only used to clear invoice items when canceling a job), Settings (tags), and Task Management.
 Connect it under **Settings → Integrations → API Application Access**. You'll have 4 values:
 Client ID, Client Secret, App Key, and Tenant ID.
 
@@ -27,6 +32,10 @@ Vercel project → **Settings → Environment Variables**:
 | `SERVICETITAN_ENV` | `production` |
 | `MCP_PATH_SECRET` | a long random password you make up (30+ letters and numbers) |
 | `BUSINESS_TIMEZONE` | optional, default `America/New_York` (e.g. `America/Chicago`) |
+| `ALLOW_WRITES` | optional — `true` to allow the write tools; leave unset for read-only |
+| `BOOKING_PROVIDER_ID` | optional — default booking provider tag (name or id) for `create_booking` |
+| `TASK_SOURCE` | optional — default task source (name or id) for `create_task` |
+| `TASK_REPORTED_BY` | optional — default "reported by" employee (name or id) for `create_task` |
 
 Then **Deployments → ⋯ → Redeploy** so the settings take effect.
 
@@ -56,7 +65,24 @@ Try: *"How much did we invoice last month by business unit?"*
 | `list_reports`, `describe_report`, `run_report` | Run any saved ServiceTitan report |
 | `api_get` | Any other ServiceTitan GET endpoint |
 
+### Write tools (need `ALLOW_WRITES=true`; always preview → confirm)
+| Tool | What it does |
+|---|---|
+| `create_booking` | New lead in Calls → Bookings |
+| `create_customer` | New customer + location (preview flags possible duplicates) |
+| `update_customer` | Name, billing address, do-not-mail / do-not-service |
+| `set_contact` | Add or change a phone/email |
+| `add_location` | New service address on a customer |
+| `add_note` | Note on a customer, location, or job |
+| `create_job` | Book a job with its first appointment and techs |
+| `reschedule_appointment` | Move an appointment |
+| `assign_technicians` | Add/remove techs on an appointment |
+| `cancel_job` | Cancel with a reason (can clear auto-added invoice items first) |
+| `create_task` | Task Management task |
+| `update_tags` | Add/remove tags on a customer, location, or job |
+
 ## Troubleshooting
 - **"login failed"** — a client id/secret is wrong, or `SERVICETITAN_ENV` doesn't match the app.
-- **403 errors** — the API app is missing the read scope for that area.
+- **403 errors** — the API app is missing the scope for that area.
+- **"Writes are turned off"** — set `ALLOW_WRITES=true` and redeploy.
 - **Connector won't connect** — check the URL ends in `/mcp` and the secret matches exactly.

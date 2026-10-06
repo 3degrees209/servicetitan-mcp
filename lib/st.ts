@@ -54,7 +54,7 @@ function buildUrl(path: string, params: Params): URL {
   return url;
 }
 
-async function request(method: "GET" | "POST", path: string, params: Params = {}, body?: unknown): Promise<any> {
+async function request(method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE", path: string, params: Params = {}, body?: unknown): Promise<any> {
   const token = await getToken();
   const url = buildUrl(path, params);
   let lastError = "";
@@ -68,7 +68,10 @@ async function request(method: "GET" | "POST", path: string, params: Params = {}
       },
       body: body ? JSON.stringify(body) : undefined,
     });
-    if (res.ok) return res.json();
+    if (res.ok) {
+      const text = await res.text();
+      return text ? JSON.parse(text) : { ok: true };
+    }
     lastError = `${res.status} ${(await res.text()).slice(0, 400)}`;
     if (res.status === 429 || res.status >= 500) {
       await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
@@ -86,6 +89,13 @@ export const stGet = (path: string, params: Params = {}) => request("GET", path,
 
 // Only used for reporting "data" calls, which are POST but read-only.
 export const stPost = (path: string, body: unknown, params: Params = {}) => request("POST", path, params, body);
+
+// Changes data in ServiceTitan. Only the write tools call this, and only after
+// writesEnabled() and an explicit confirm.
+export const stWrite = (method: "POST" | "PATCH" | "PUT" | "DELETE", path: string, body?: unknown) =>
+  request(method, path, {}, body);
+
+export const writesEnabled = () => process.env.ALLOW_WRITES?.trim().toLowerCase() === "true";
 
 // Pages through a list endpoint until done or maxRecords is reached.
 export async function stGetAll(path: string, params: Params = {}, maxRecords = 2000): Promise<{ data: any[]; truncated: boolean }> {
@@ -115,6 +125,9 @@ export const technicianNames = () => lookup("tech", "settings/v2/tenant/{tenant}
 export const businessUnitNames = () => lookup("bu", "settings/v2/tenant/{tenant}/business-units", (r) => r.name);
 export const jobTypeNames = () => lookup("jt", "jpm/v2/tenant/{tenant}/job-types", (r) => r.name);
 export const campaignNames = () => lookup("camp", "marketing/v2/tenant/{tenant}/campaigns", (r) => r.name);
+export const tagTypeNames = () => lookup("tag", "settings/v2/tenant/{tenant}/tag-types", (r) => r.name);
+export const cancelReasonNames = () => lookup("cancel", "jpm/v2/tenant/{tenant}/job-cancel-reasons", (r) => r.name);
+export const bookingProviderNames = () => lookup("bp", "crm/v2/tenant/{tenant}/booking-provider-tags", (r) => r.tagName);
 
 // Resolves a business unit / technician given as a name fragment or id.
 export async function resolveId(map: Map<number, string>, value: string | undefined, label: string): Promise<number | undefined> {
@@ -129,14 +142,14 @@ export async function resolveId(map: Map<number, string>, value: string | undefi
   throw new Error(`"${value}" matches several ${label}s: ${matches.map(([, n]) => n).join(", ")}. Be more specific.`);
 }
 
-// ServiceTitan date filters take UTC timestamps. A plain YYYY-MM-DD is read as
-// midnight in the business's time zone (BUSINESS_TIMEZONE, default Eastern).
+// ServiceTitan wants UTC timestamps. A plain YYYY-MM-DD or YYYY-MM-DDTHH:MM
+// (no zone) is read as local time in BUSINESS_TIMEZONE (default Eastern).
 export function dateParam(d: string | undefined): string | undefined {
   if (!d) return undefined;
-  const m = d.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  const m = d.trim().match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?$/);
   if (!m) return d;
   const tz = process.env.BUSINESS_TIMEZONE || "America/New_York";
-  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+  const guess = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0));
   const parts = Object.fromEntries(
     new Intl.DateTimeFormat("en-US", {
       timeZone: tz, hourCycle: "h23", year: "numeric", month: "2-digit", day: "2-digit",

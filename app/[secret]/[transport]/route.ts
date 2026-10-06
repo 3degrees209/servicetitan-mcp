@@ -12,6 +12,7 @@ import {
   stPost,
   technicianNames,
 } from "../../../lib/st";
+import { registerWriteTools } from "../../../lib/writes";
 
 export const maxDuration = 60;
 
@@ -59,6 +60,7 @@ const handler = createMcpHandler(
         street: z.string().optional().describe("Street address (partial ok)"),
         zip: z.string().optional(),
       },
+      { readOnlyHint: true },
       safe(async ({ name, phone, street, zip }) => {
         if (!name && !phone && !street && !zip) return err("Give at least one of name, phone, street, zip.");
         const res = await stGet("crm/v2/tenant/{tenant}/customers", {
@@ -80,6 +82,7 @@ const handler = createMcpHandler(
       "get_customer",
       "Full details for one customer: profile, contacts (phones/emails), service locations, recent jobs, and open invoice balance.",
       { customer_id: z.number().describe("ServiceTitan customer id") },
+      { readOnlyHint: true },
       safe(async ({ customer_id }) => {
         const [customer, contacts, locations, jobs, invoices] = await Promise.all([
           stGet(`crm/v2/tenant/{tenant}/customers/${customer_id}`),
@@ -91,7 +94,7 @@ const handler = createMcpHandler(
         const [jt, bu] = await Promise.all([jobTypeNames(), businessUnitNames()]);
         return json({
           customer,
-          contacts: contacts.data.map((c: any) => ({ type: c.type, value: c.value, memo: c.memo })),
+          contacts: contacts.data.map((c: any) => ({ id: c.id, type: c.type, value: c.value, memo: c.memo })),
           locations: locations.data.map((l: any) => ({ id: l.id, name: l.name, address: l.address })),
           recent_jobs: jobs.data.map((j: any) => ({
             id: j.id, number: j.jobNumber, status: j.jobStatus, type: jt.get(j.jobTypeId),
@@ -118,6 +121,7 @@ const handler = createMcpHandler(
         customer_id: z.number().optional(),
         include_jobs: z.boolean().optional().describe("Return the individual jobs (default true; set false for big ranges and just read the summary)"),
       },
+      { readOnlyHint: true },
       safe(async (a) => {
         const [bu, jt, tech] = await Promise.all([businessUnitNames(), jobTypeNames(), technicianNames()]);
         const field = a.date_field ?? (a.status === "Completed" ? "completed" : "created");
@@ -158,6 +162,7 @@ const handler = createMcpHandler(
         to: z.string().describe(`${DATE} (exclusive)`),
         technician: z.string().optional().describe("Technician name (partial ok) or id"),
       },
+      { readOnlyHint: true },
       safe(async ({ from, to, technician }) => {
         const tech = await technicianNames();
         const techId = await resolveId(tech, technician, "technician");
@@ -199,6 +204,7 @@ const handler = createMcpHandler(
         unpaid_only: z.boolean().optional().describe("Only invoices with a balance due"),
         include_invoices: z.boolean().optional().describe("Also return individual invoices (max 300)"),
       },
+      { readOnlyHint: true },
       safe(async (a) => {
         const bu = await businessUnitNames();
         const { data, truncated } = await stGetAll("accounting/v2/tenant/{tenant}/invoices", {
@@ -235,6 +241,7 @@ const handler = createMcpHandler(
         to: z.string().describe(`${DATE} (exclusive)`),
         include_payments: z.boolean().optional(),
       },
+      { readOnlyHint: true },
       safe(async ({ from, to, include_payments }) => {
         const { data, truncated } = await stGetAll("accounting/v2/tenant/{tenant}/payments", {
           paidOnAfter: dateParam(from), paidOnBefore: dateParam(to),
@@ -260,6 +267,7 @@ const handler = createMcpHandler(
         date_field: z.enum(["created", "sold"]).optional().describe("Filter on created date (default) or sold date"),
         include_estimates: z.boolean().optional(),
       },
+      { readOnlyHint: true },
       safe(async ({ from, to, date_field, include_estimates }) => {
         const range = date_field === "sold"
           ? { soldAfter: dateParam(from), soldBefore: dateParam(to) }
@@ -294,6 +302,7 @@ const handler = createMcpHandler(
         to: z.string().describe(`${DATE} (exclusive)`),
         include_calls: z.boolean().optional(),
       },
+      { readOnlyHint: true },
       safe(async ({ from, to, include_calls }) => {
         const { data, truncated } = await stGetAll("telecom/v3/tenant/{tenant}/calls", {
           createdOnOrAfter: dateParam(from), createdBefore: dateParam(to),
@@ -323,8 +332,22 @@ const handler = createMcpHandler(
     server.tool(
       "list_reference",
       "Lookup lists: technicians, business units, job types, campaigns, employees, or tag types. Use to learn the names before filtering other tools.",
-      { kind: z.enum(["technicians", "business_units", "job_types", "campaigns", "employees", "tag_types"]) },
+      {
+        kind: z.enum([
+          "technicians", "business_units", "job_types", "campaigns", "employees", "tag_types",
+          "cancel_reasons", "booking_providers", "task_options",
+        ]),
+      },
+      { readOnlyHint: true },
       safe(async ({ kind }) => {
+        if (kind === "task_options") {
+          const d = await stGet("taskmanagement/v2/tenant/{tenant}/data");
+          const slim = (rows: any[], id = "id") => (rows ?? []).filter((r) => r.active !== false).map((r) => ({ id: r[id], name: r.name }));
+          return json({
+            employees: slim(d.employees), task_types: slim(d.taskTypes), sources: slim(d.taskSources),
+            business_units: slim(d.businessUnits, "value"), priorities: (d.taskPriorities ?? []).map((p: any) => p.name),
+          });
+        }
         const paths = {
           technicians: "settings/v2/tenant/{tenant}/technicians",
           business_units: "settings/v2/tenant/{tenant}/business-units",
@@ -332,11 +355,13 @@ const handler = createMcpHandler(
           campaigns: "marketing/v2/tenant/{tenant}/campaigns",
           employees: "settings/v2/tenant/{tenant}/employees",
           tag_types: "settings/v2/tenant/{tenant}/tag-types",
+          cancel_reasons: "jpm/v2/tenant/{tenant}/job-cancel-reasons",
+          booking_providers: "crm/v2/tenant/{tenant}/booking-provider-tags",
         };
         const { data } = await stGetAll(paths[kind], {}, 5000);
         return json({
           count: data.length,
-          items: data.map((r: any) => ({ id: r.id, name: r.name, active: r.active, role: r.role, businessUnitId: r.businessUnitId })),
+          items: data.map((r: any) => ({ id: r.id, name: r.name ?? r.tagName, active: r.active, role: r.role, businessUnitId: r.businessUnitId })),
         });
       })
     );
@@ -345,6 +370,7 @@ const handler = createMcpHandler(
       "list_reports",
       "List the saved reports in the ServiceTitan Reporting module. Without a category, lists report categories. With a category, lists its reports. Then use describe_report and run_report.",
       { category: z.string().optional().describe("Report category id, e.g. 'operations', 'accounting', 'marketing', 'technician'") },
+      { readOnlyHint: true },
       safe(async ({ category }) => {
         if (!category) {
           const { data } = await stGetAll("reporting/v2/tenant/{tenant}/report-categories");
@@ -359,6 +385,7 @@ const handler = createMcpHandler(
       "describe_report",
       "Show a saved report's parameters (e.g. date range, business units) and output columns. Call before run_report.",
       { category: z.string(), report_id: z.number() },
+      { readOnlyHint: true },
       safe(async ({ category, report_id }) =>
         json(await stGet(`reporting/v2/tenant/{tenant}/report-category/${category}/reports/${report_id}`))
       )
@@ -373,6 +400,7 @@ const handler = createMcpHandler(
         parameters: z.array(z.object({ name: z.string(), value: z.any() })).default([]),
         max_rows: z.number().optional().describe("Default 1000"),
       },
+      { readOnlyHint: true },
       safe(async ({ category, report_id, parameters, max_rows }) => {
         const limit = max_rows ?? 1000;
         const res = await stPost(
@@ -393,6 +421,7 @@ const handler = createMcpHandler(
         path: z.string(),
         params: z.record(z.union([z.string(), z.number(), z.boolean()])).optional(),
       },
+      { readOnlyHint: true },
       safe(async ({ path, params }) => {
         const clean = path.replace(/^https?:\/\/[^/]+\//, "").replace(/^\//, "");
         if (!/^[a-z-]+\/v\d+\/tenant\/(\{tenant\}|\d+)\//.test(clean)) {
@@ -401,11 +430,13 @@ const handler = createMcpHandler(
         return json(await stGet(clean.replace(/tenant\/\d+\//, "tenant/{tenant}/"), params ?? {}));
       })
     );
+
+    registerWriteTools(server);
   },
   {
     serverInfo: { name: "servicetitan", version: "1.0.0" },
     instructions:
-      "Read-only access to this company's ServiceTitan data. Prefer the summary tools (list_jobs, invoices_summary, estimates_summary, calls_summary, payments_summary) for totals; use list_reference to learn technician/business-unit names; use saved reports (list_reports → describe_report → run_report) for anything matching a report the company already uses; use api_get only as a last resort. Plain dates are in the business's local time zone and 'to' dates are exclusive.",
+      "Access to this company's ServiceTitan data. Prefer the summary tools (list_jobs, invoices_summary, estimates_summary, calls_summary, payments_summary) for totals; use list_reference to learn technician/business-unit names; use saved reports (list_reports → describe_report → run_report) for anything matching a report the company already uses; use api_get only as a last resort. Write tools (create_*, update_*, add_*, set_contact, reschedule_appointment, cancel_job, assign_technicians) always return a preview first: show it to the user, and only call again with confirm: true after they explicitly approve. Never confirm on your own. Plain dates are in the business's local time zone and 'to' dates are exclusive.",
   },
   {
     // Requests are re-addressed to /connector/mcp below, so a secret with
