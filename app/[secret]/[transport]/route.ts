@@ -408,7 +408,9 @@ const handler = createMcpHandler(
       "Read-only access to this company's ServiceTitan data. Prefer the summary tools (list_jobs, invoices_summary, estimates_summary, calls_summary, payments_summary) for totals; use list_reference to learn technician/business-unit names; use saved reports (list_reports → describe_report → run_report) for anything matching a report the company already uses; use api_get only as a last resort. Plain dates are in the business's local time zone and 'to' dates are exclusive.",
   },
   {
-    basePath: `/${process.env.MCP_PATH_SECRET}`,
+    // Requests are re-addressed to /connector/mcp below, so a secret with
+    // characters that get URL-encoded can't break route matching.
+    basePath: "/connector",
     maxDuration: 60,
     verboseLogs: false,
   }
@@ -417,14 +419,17 @@ const handler = createMcpHandler(
 // The URL's secret segment is the only auth — wrong secret → 404.
 async function guarded(req: Request, ctx: { params: Promise<{ secret: string; transport: string }> }) {
   const { secret, transport } = await ctx.params;
-  if (!process.env.MCP_PATH_SECRET || secret !== process.env.MCP_PATH_SECRET) {
+  const expected = process.env.MCP_PATH_SECRET?.trim();
+  if (!expected || decodeURIComponent(secret).trim() !== expected) {
     return new Response("Not found", { status: 404 });
   }
   if (transport !== "mcp") {
     // SSE legacy transport needs Redis; we only serve streamable HTTP.
     return new Response("Not found", { status: 404 });
   }
-  return handler(req);
+  const url = new URL(req.url);
+  url.pathname = "/connector/mcp";
+  return handler(new Request(url, req));
 }
 
 export { guarded as GET, guarded as POST, guarded as DELETE };
